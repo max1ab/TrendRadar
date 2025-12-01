@@ -3022,6 +3022,37 @@ def add_batch_headers(
     return result
 
 
+def build_bark_messages(report_data: Dict, max_bytes: int) -> List[str]:
+    """将 Bark 推送拆成纯新闻内容，每条新闻单独一条消息"""
+    messages = []
+    seen = set()
+
+    def add_title(title_data: Dict):
+        formatted = format_title_for_platform("bark", title_data, show_source=True)
+        # 避免重复推送相同内容
+        if formatted in seen:
+            return
+        seen.add(formatted)
+
+        # Bark 单条内容也做安全截断，防止超出 APNs 限制
+        safe_text = (
+            _truncate_to_bytes(formatted, max_bytes)
+            if len(formatted.encode("utf-8")) > max_bytes
+            else formatted
+        )
+        messages.append(safe_text)
+
+    for stat in report_data.get("stats", []):
+        for title_data in stat.get("titles", []):
+            add_title(title_data)
+
+    for source_data in report_data.get("new_titles", []):
+        for title_data in source_data.get("titles", []):
+            add_title(title_data)
+
+    return messages
+
+
 def split_content_into_batches(
     report_data: Dict,
     format_type: str,
@@ -3030,6 +3061,11 @@ def split_content_into_batches(
     mode: str = "daily",
 ) -> List[str]:
     """分批处理消息内容，确保词组标题+至少第一条新闻的完整性"""
+    # Bark 只需要新闻正文，一条新闻一条消息
+    if format_type == "bark":
+        bark_max_bytes = max_bytes or CONFIG.get("BARK_BATCH_SIZE", 3600)
+        return build_bark_messages(report_data, bark_max_bytes)
+
     if max_bytes is None:
         if format_type == "dingtalk":
             max_bytes = CONFIG.get("DINGTALK_BATCH_SIZE", 20000)
@@ -4356,13 +4392,13 @@ def send_to_bark(
 
     # 获取分批内容（Bark 限制为 3600 字节以避免 413 错误），预留批次头部空间
     bark_batch_size = CONFIG["BARK_BATCH_SIZE"]
-    header_reserve = _get_max_batch_header_size("bark")
     batches = split_content_into_batches(
-        report_data, "bark", update_info, max_bytes=bark_batch_size - header_reserve, mode=mode
+        report_data, "bark", update_info, max_bytes=bark_batch_size, mode=mode
     )
 
-    # 统一添加批次头部（已预留空间，不会超限）
-    batches = add_batch_headers(batches, "bark", bark_batch_size)
+    if not batches:
+        print(f"Bark没有可发送的新闻内容 [{report_type}]")
+        return True
 
     total_batches = len(batches)
     print(f"Bark消息分为 {total_batches} 批次发送 [{report_type}]")
@@ -4392,7 +4428,8 @@ def send_to_bark(
 
         # 构建JSON payload
         payload = {
-            "title": report_type,
+            # Bark 不展示标题，只推送正文
+            "title": "",
             "markdown": batch_content,
             "device_key": device_key,
             "sound": "default",
